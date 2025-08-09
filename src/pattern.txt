@@ -1,24 +1,58 @@
-Legend:
-. = short ON (120 ms)
-- = long ON (≥400 ms)
-(space) = short OFF (120 ms)
-/ = long pause (≥700 ms)
-[solid] = continuously ON
+LED patterns (dot = short on, dash = long on)
 
-OFF: (no signal)
+    OFF — (no light)
+    use: disabled
 
-BOOTING (3 quick, pause): . . . / (repeat)
+    BOOTING — • • • | (three shorts, pause, repeat)
+    use: at startup while subsystems init
 
-IDLE / WAITING FOR BLACKBOX (heartbeat): . / (repeat)
+    IDLE_WAITING_BB — • …… (single short heartbeat about every ~2s)
+    use: SD mounted OK, waiting for Blackbox data (not armed / no stream yet)
 
-LOGGING: [solid]
+    LOGGING — ——— (solid ON)
+    use: actively writing a .BFL file
 
-SERIAL LOST (double blink): . . / (repeat)
+    SERIAL_LOST — • • … (double short, pause, repeat)
+    use: no UART data for a few seconds while waiting for a header
 
-SD ERROR (triple blink): . . . / (repeat)
+    SD_ERROR — • • • … (triple short, pause, repeat)
+    use: SD missing / mount failed / open failed / write error
 
-LOW SPACE (long–short, pause): - . / (repeat)
+    LOW_SPACE — — • | (long-short, pause, repeat)
+    use: free space below threshold (optional if/when space check is enabled)
 
-FILE CLOSING (strobe burst): . . . . . - (one-shot burst)
+    FILE_CLOSING (pulse) — • • • • • — (five quick strobes, brief pause)
+    use: brief overlay when we auto-close after idle; auto-reverts to IDLE
 
-FATAL (very long on, short off): - . (repeat; “-” here is a very long ON ~2 s)
+    FATAL — —— (2s) • (very long on, short off, repeat)
+    use: unrecoverable error (e.g., UART init failure)
+
+    Legend:
+    • short blink (~80–120 ms), — long blink (~400–2000 ms depending on pattern),
+    spaces show small gaps; |/… indicate the longer pause before repeating.
+
+Priority (highest wins)
+
+    FATAL
+
+    SD_ERROR (no card / mount/open/write error)
+
+    LOGGING (active file)
+
+    FILE_CLOSING (pulse) — temporary overlay; after the pulse it reverts to the prior persistent state (usually IDLE)
+
+    LOW_SPACE (when enabled)
+
+    SERIAL_LOST (only when waiting for data and SD is OK; not shown while LOGGING)
+
+    IDLE_WAITING_BB (default steady state when ready but not logging)
+
+    OFF
+
+Notes:
+
+    BOOTING is only used during startup; once SD/UART init completes, a higher-priority steady state takes over (IDLE, SD_ERROR, etc.).
+
+    The code paths already enforce this order: e.g., we never set SERIAL_LOST while logging, and SD errors override idle/serial states.
+
+    The FILE_CLOSING pulse is explicitly non-persistent: it plays, then returns to the previous persistent status.
