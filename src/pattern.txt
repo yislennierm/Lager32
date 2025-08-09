@@ -1,0 +1,24 @@
+Legend:
+. = short ON (120 ms)
+- = long ON (≥400 ms)
+(space) = short OFF (120 ms)
+/ = long pause (≥700 ms)
+[solid] = continuously ON
+
+OFF: (no signal)
+
+BOOTING (3 quick, pause): . . . / (repeat)
+
+IDLE / WAITING FOR BLACKBOX (heartbeat): . / (repeat)
+
+LOGGING: [solid]
+
+SERIAL LOST (double blink): . . / (repeat)
+
+SD ERROR (triple blink): . . . / (repeat)
+
+LOW SPACE (long–short, pause): - . / (repeat)
+
+FILE CLOSING (strobe burst): . . . . . - (one-shot burst)
+
+FATAL (very long on, short off): - . (repeat; “-” here is a very long ON ~2 s)
