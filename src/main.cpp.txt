@@ -16,7 +16,11 @@
 
 #include "esp_system.h" // for esp_reset_reason()
 
+#include "boards.h"
 #include "led_status.h"
+
+
+
 
 // ===== Debug switches =====
 #define BB_DEBUG 1       // set 0 to silence logs
@@ -36,10 +40,20 @@
 
 // ----- SD over SPI pins (adjust to your wiring) -----
 // Lolin S2 Mini (change if you use different pins)
-#define PIN_NUM_MOSI 35
-#define PIN_NUM_MISO 37
-#define PIN_NUM_SCLK 36
-#define PIN_NUM_CS   34
+// NOTE: For LOLIN S2 Mini, recommended: CS=21, SCK=14, MISO=12, MOSI=13.
+// The current pins below are left as provided.
+// LOLIN S2 Mini SPI pins for SD card
+
+
+
+
+#if defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  static SPIClass sdSPI(FSPI);   // S2/S3
+#else
+  static SPIClass sdSPI(VSPI);   // classic ESP32 (WROVER)
+#endif
+
+
 
 // ----- UART for Blackbox stream -----
 // ESP32-S2 HardwareSerial1
@@ -59,6 +73,10 @@
 // Space monitoring
 #define LOW_SPACE_BYTES (50ULL * 1024ULL * 1024ULL) // 50 MB
 
+// SD mount / wait behavior
+#define SD_RETRY_MS    2000       // retry interval while waiting for SD
+static const uint32_t SD_SPEEDS[] = { 1000000, 4000000, 10000000, 20000000 };
+
 // ============================
 
 static const char *reset_reason_str(esp_reset_reason_t r) {
@@ -77,8 +95,7 @@ static const char *reset_reason_str(esp_reset_reason_t r) {
   }
 }
 
-// We'll drive SD over an explicit SPI bus instance
-static SPIClass sdSPI(FSPI);
+
 
 // Current log file
 static File s_logf;
@@ -248,42 +265,73 @@ static void decide_led_status(void) {
 }
 
 // ============================
-// === Hardware init
+// === SD init / wait logic
 // ============================
-static bool init_sdspi(void) {
-  DLOGI("Mounting SD (Arduino SD over SPI)");
+static void sd_flags_clear_errors(void) {
+  s_sd_write_error = false;
+}
 
-  // Setup SPI pins & speed
+static bool sd_mount_once_try(uint32_t hz) {
+  DLOGI("Mounting SD at %u Hz", (unsigned)hz);
   sdSPI.begin(PIN_NUM_SCLK, PIN_NUM_MISO, PIN_NUM_MOSI, PIN_NUM_CS);
-
-  // Begin SD: CS pin, SPI instance, and SPI clock (Hz)
-  if (!SD.begin(PIN_NUM_CS, sdSPI, 20000000 /*20 MHz*/)) {
-    DLOGE("SD.begin() failed");
-    s_sd_ok = false;
-    s_sd_write_error = true;     // mark as error so LED shows SD_ERROR
-    decide_led_status();
+  bool ok = SD.begin(PIN_NUM_CS, sdSPI, hz);
+  if (!ok) {
+    DLOGE("SD.begin failed at %u Hz", (unsigned)hz);
+    SD.end();
     return false;
   }
-
-  s_sd_ok = true;
-  s_sd_write_error = false;
-  s_sd_low_space = space_low_now();
-  decide_led_status();
-
-  uint64_t total = SD.totalBytes();
-  uint64_t used  = SD.usedBytes();
-  DLOGI("SD OK, total=%llu MB, used=%llu MB", (unsigned long long)(total/1024/1024), (unsigned long long)(used/1024/1024));
   return true;
 }
 
+static bool sd_mount_once(void) {
+  // Try multiple speeds, slow -> fast
+  for (size_t i = 0; i < sizeof(SD_SPEEDS)/sizeof(SD_SPEEDS[0]); ++i) {
+    if (sd_mount_once_try(SD_SPEEDS[i])) {
+      s_sd_ok = true;
+      sd_flags_clear_errors();
+      s_sd_low_space = space_low_now();
+      decide_led_status();
+      uint64_t total = SD.totalBytes();
+      uint64_t used  = SD.usedBytes();
+      DLOGI("SD OK, total=%llu MB, used=%llu MB",
+            (unsigned long long)(total/1024/1024), (unsigned long long)(used/1024/1024));
+      return true;
+    }
+  }
+  s_sd_ok = false;
+  s_sd_write_error = true;   // show SD_ERROR LED while waiting
+  decide_led_status();
+  return false;
+}
+
+static void sd_wait_until_ready(void) {
+  DLOGI("Waiting for SD card… insert card if not present");
+  uint32_t last_msg = 0;
+  while (!sd_mount_once()) {
+    vTaskDelay(pdMS_TO_TICKS(SD_RETRY_MS));
+    uint32_t now = millis();
+    if ((now - last_msg) > 3000) {
+      last_msg = now;
+      DLOGI("Still waiting for SD… check wiring/pins and that the card is inserted");
+    }
+  }
+  // Mounted
+  s_sd_low_space = space_low_now();
+  decide_led_status();
+}
+
+// Deinit (optional)
 static void deinit_sdspi(void) {
   if (s_logf) s_logf.close();
+  SD.end();
   s_sd_ok = false;
   decide_led_status();
 }
 
+// ============================
+// === UART init
+// ============================
 static void init_uart(void) {
-  // NOTE: Serial.begin() is done in setup(); keep this only for Serial1
   Serial1.setRxBufferSize(UART_BUF_SIZE);
   Serial1.begin(BB_UART_BAUD, SERIAL_8N1, BB_UART_RX_PIN, BB_UART_TX_PIN, false);
   Serial1.setTimeout(50);
@@ -401,6 +449,7 @@ static void uart_logger_task(void *arg) {
 // ============================
 void setup() {
   Serial.begin(115200);
+  vTaskDelay(pdMS_TO_TICKS(500));
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 3000) { delay(10); } // wait up to 3s for monitor
 
@@ -413,21 +462,11 @@ void setup() {
   led_status_init();
   led_set_status(LED_STAT_BOOTING);
 
-  // Serial1 + pins
-  Serial1.setRxBufferSize(UART_BUF_SIZE);
-  Serial1.begin(BB_UART_BAUD, SERIAL_8N1, BB_UART_RX_PIN, BB_UART_TX_PIN, false);
-  Serial1.setTimeout(50);
-
   DLOGI("Starting Serial Blackbox logger (Arduino SD)");
 
-  // Mount SD (single retry already in your flow)
-  if (!init_sdspi()) {
-    DLOGE("SD mount failed; retrying in 3s");
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    deinit_sdspi();
-    ESP.restart();
-
-  }
+  // ===== BLOCK HERE UNTIL SD CARD IS READY =====
+  sd_wait_until_ready();
+  // ============================================
 
   // Prepare next filename index by scanning (optional quick pass)
   for (int i = 1; i <= MAX_FILE_INDEX; ++i) {
@@ -436,7 +475,8 @@ void setup() {
     if (!path_exists(p)) { s_next_index = i; break; }
   }
 
-  // From here, the UART task will drive status changes
+  // Now that SD is confirmed, bring up UART and start logger task
+  init_uart();
   xTaskCreatePinnedToCore(uart_logger_task, "uart_logger", 6144, NULL, 5, NULL, 0);
 
   // After boot, let resolver pick the steady-state

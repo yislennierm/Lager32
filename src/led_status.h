@@ -4,7 +4,7 @@
 
 // ==== Config (you may override before including) ====
 #ifndef LED_GPIO
-#define LED_GPIO 15          // LOLIN S2 Mini onboard LED
+#define LED_GPIO 2          // LOLIN S2 Mini onboard LED
 #endif
 
 #ifndef LED_ACTIVE_HIGH
