@@ -1,0 +1,458 @@
+// File: src/main.cpp  (Arduino / PlatformIO, framework = arduino)
+// Uses Arduino-ESP32 SD library (SD.h) over SPI on ESP32-S2 (Lolin S2 Mini)
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <FS.h>
+#include <SD.h>
+
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+
+// FreeRTOS is available under Arduino-ESP32
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_system.h" // for esp_reset_reason()
+
+#include "led_status.h"
+
+// ===== Debug switches =====
+#define BB_DEBUG 1       // set 0 to silence logs
+#define BB_DEBUG_BYTES 0 // set 1 to dump incoming bytes (noisy)
+
+#if BB_DEBUG
+  #define DLOGI(...) do { Serial.printf("[I] "); Serial.printf(__VA_ARGS__); Serial.println(); } while (0)
+  #define DLOGE(...) do { Serial.printf("[E] "); Serial.printf(__VA_ARGS__); Serial.println(); } while (0)
+#else
+  #define DLOGI(...) do {} while (0)
+  #define DLOGE(...) do {} while (0)
+#endif
+
+// ============================
+// === USER CONFIG ZONE =======
+// ============================
+
+// ----- SD over SPI pins (adjust to your wiring) -----
+// Lolin S2 Mini (change if you use different pins)
+#define PIN_NUM_MOSI 35
+#define PIN_NUM_MISO 37
+#define PIN_NUM_SCLK 36
+#define PIN_NUM_CS   34
+
+// ----- UART for Blackbox stream -----
+// ESP32-S2 HardwareSerial1
+#define BB_UART_RX_PIN 18      // FC TX -> ESP32 RX
+#define BB_UART_TX_PIN -1      // not used
+#define BB_UART_BAUD   2000000 // 2,000,000 baud
+
+// File & buffering
+#define MAX_FILE_INDEX   9999
+#define PREBUF_SIZE      8192     // pre-header ring buffer
+#define UART_BUF_SIZE    4096     // driver RX ring (Serial1.setRxBufferSize)
+#define READ_CHUNK       1024     // read chunk from UART
+#define IDLE_TIMEOUT_MS  1200     // close file after idle
+#define SERIAL_LOST_MS   3000     // status indication when waiting with no data
+#define FLUSH_BYTES      (64 * 1024)
+
+// Space monitoring
+#define LOW_SPACE_BYTES (50ULL * 1024ULL * 1024ULL) // 50 MB
+
+// ============================
+
+static const char *reset_reason_str(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "Power-on";
+    case ESP_RST_EXT:       return "External";
+    case ESP_RST_SW:        return "Software";
+    case ESP_RST_PANIC:     return "Panic";
+    case ESP_RST_INT_WDT:   return "Int WDT";
+    case ESP_RST_TASK_WDT:  return "Task WDT";
+    case ESP_RST_WDT:       return "Other WDT";
+    case ESP_RST_DEEPSLEEP: return "Deep-sleep";
+    case ESP_RST_BROWNOUT:  return "Brownout";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "Unknown";
+  }
+}
+
+// We'll drive SD over an explicit SPI bus instance
+static SPIClass sdSPI(FSPI);
+
+// Current log file
+static File s_logf;
+
+// ---------- LED/state resolver flags ----------
+static volatile bool s_fatal = false;
+static volatile bool s_sd_ok = false;
+static volatile bool s_sd_write_error = false;
+static volatile bool s_sd_low_space = false;
+static volatile bool s_logging_active = false;
+static volatile bool s_ever_saw_header = false;
+static volatile uint32_t s_uart_quiet_ms = 0;
+// ---------------------------------------------
+
+typedef enum { WAIT_HEADER = 0, LOGGING } log_state_t;
+
+static log_state_t s_state = WAIT_HEADER;
+static int s_next_index = 1;
+static uint32_t s_last_rx_ms = 0;
+static size_t s_since_flush = 0;
+
+// simple ring buffer to catch header bytes before we open the file
+typedef struct {
+  uint8_t data[PREBUF_SIZE];
+  size_t  head;   // write index
+  bool    filled; // wrapped at least once
+} ring_t;
+
+static ring_t s_prebuf = { .head = 0, .filled = false };
+
+// line buffer to detect "H " header lines
+#define BB_LINE_MAX 512
+static char s_line[BB_LINE_MAX];
+static size_t s_linelen = 0;
+static bool s_at_line_start = true;
+
+// Forward decls
+static void decide_led_status(void);
+static void uart_logger_task(void *);
+
+// ============================
+// === Helpers
+// ============================
+
+static void ring_put(ring_t *r, const uint8_t *buf, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    r->data[r->head] = buf[i];
+    r->head = (r->head + 1) % PREBUF_SIZE;
+    if (r->head == 0) r->filled = true;
+  }
+}
+
+static void ring_dump_to_file(ring_t *r, File &f) {
+  if (!f) return;
+  if (!r->filled && r->head == 0) return;
+
+  if (r->filled) {
+    f.write(&r->data[r->head], PREBUF_SIZE - r->head);
+    f.write(&r->data[0],       r->head);
+  } else {
+    f.write(&r->data[0], r->head);
+  }
+  // clear
+  r->head = 0;
+  r->filled = false;
+}
+
+static bool path_exists(const char *path) {
+  return SD.exists(path);
+}
+
+static bool space_low_now(void) {
+  // Arduino-ESP32 SD exposes total/used bytes
+  uint64_t total = SD.totalBytes();
+  uint64_t used  = SD.usedBytes();
+  if (total == 0ULL) return false; // not mounted / unknown
+  uint64_t freeB = (total > used) ? (total - used) : 0ULL;
+  return freeB < LOW_SPACE_BYTES;
+}
+
+static bool find_next_filename(char *out, size_t outlen) {
+  for (int i = s_next_index; i <= MAX_FILE_INDEX; ++i) {
+    snprintf(out, outlen, "/LOG%04d.BFL", i);
+    if (!path_exists(out)) { s_next_index = i + 1; return true; }
+  }
+  return false;
+}
+
+static void close_current_file(void) {
+  if (s_logf) {
+    DLOGI("Closing file");
+    s_logf.flush();
+    s_logf.close();
+  }
+  s_logging_active = false;
+  s_state = WAIT_HEADER;
+  s_since_flush = 0;
+  s_linelen = 0;
+  s_at_line_start = true;
+  decide_led_status();
+}
+
+// LED: short helper to show “closing” pulse
+static inline void indicate_file_closing_then_idle(void) {
+  led_pulse_file_closing(400);            // quick strobe burst
+  vTaskDelay(pdMS_TO_TICKS(450));         // let the pulse sequence play
+}
+
+static bool open_new_file_and_dump_prebuf(void) {
+  char path[32];
+  if (!find_next_filename(path, sizeof(path))) {
+    DLOGE("No free filename slots");
+    s_sd_write_error = true; // treat as SD error for LED
+    decide_led_status();
+    return false;
+  }
+
+  s_logf = SD.open(path, FILE_WRITE); // creates if not exists, starts at end (new file -> empty)
+  if (!s_logf) {
+    DLOGE("open(%s) failed", path);
+    s_sd_write_error = true;
+    decide_led_status();
+    return false;
+  }
+
+  DLOGI("Opened %s", path);
+  ring_dump_to_file(&s_prebuf, s_logf);
+
+  s_since_flush = 0;
+  s_state = LOGGING;
+  s_logging_active = true;
+  decide_led_status();
+  return true;
+}
+
+// Very light header detection: true if a line starts with "H " (or "H\t")
+static bool is_blackbox_header_line(const char *line, size_t len) {
+  if (len < 2) return false;
+  return (line[0] == 'H' && (line[1] == ' ' || line[1] == '\t'));
+}
+
+// ---------- LED priority resolver ----------
+static void decide_led_status(void) {
+  static int last = -1;
+  auto set_if_changed = [&](int st, const char *name) {
+    if (st != last) {
+      last = st;
+      DLOGI("LED status -> %s  flags{sd_ok=%d wr_err=%d low=%d log=%d sawH=%d quiet=%u}",
+            name, (int)s_sd_ok, (int)s_sd_write_error, (int)s_sd_low_space,
+            (int)s_logging_active, (int)s_ever_saw_header, (unsigned)s_uart_quiet_ms);
+      led_set_status((led_status_t)st);
+    }
+  };
+
+  if (s_fatal)                           { set_if_changed(LED_STAT_FATAL,        "FATAL");        return; }
+  if (!s_sd_ok || s_sd_write_error)      { set_if_changed(LED_STAT_SD_ERROR,     "SD_ERROR");     return; }
+  if (s_sd_low_space)                    { set_if_changed(LED_STAT_LOW_SPACE,    "LOW_SPACE");    return; }
+  if (s_logging_active)                  { set_if_changed(LED_STAT_LOGGING,      "LOGGING");      return; }
+
+  if (!s_ever_saw_header) {
+    if (s_uart_quiet_ms > SERIAL_LOST_MS)  set_if_changed(LED_STAT_SERIAL_LOST,    "SERIAL_LOST(pre)");
+    else                                    set_if_changed(LED_STAT_IDLE_WAITING_BB,"IDLE_WAITING_BB(pre)");
+    return;
+  }
+  if (s_uart_quiet_ms > SERIAL_LOST_MS)  { set_if_changed(LED_STAT_SERIAL_LOST,   "SERIAL_LOST"); return; }
+  set_if_changed(LED_STAT_IDLE_WAITING_BB, "IDLE_WAITING_BB");
+}
+
+// ============================
+// === Hardware init
+// ============================
+static bool init_sdspi(void) {
+  DLOGI("Mounting SD (Arduino SD over SPI)");
+
+  // Setup SPI pins & speed
+  sdSPI.begin(PIN_NUM_SCLK, PIN_NUM_MISO, PIN_NUM_MOSI, PIN_NUM_CS);
+
+  // Begin SD: CS pin, SPI instance, and SPI clock (Hz)
+  if (!SD.begin(PIN_NUM_CS, sdSPI, 20000000 /*20 MHz*/)) {
+    DLOGE("SD.begin() failed");
+    s_sd_ok = false;
+    s_sd_write_error = true;     // mark as error so LED shows SD_ERROR
+    decide_led_status();
+    return false;
+  }
+
+  s_sd_ok = true;
+  s_sd_write_error = false;
+  s_sd_low_space = space_low_now();
+  decide_led_status();
+
+  uint64_t total = SD.totalBytes();
+  uint64_t used  = SD.usedBytes();
+  DLOGI("SD OK, total=%llu MB, used=%llu MB", (unsigned long long)(total/1024/1024), (unsigned long long)(used/1024/1024));
+  return true;
+}
+
+static void deinit_sdspi(void) {
+  if (s_logf) s_logf.close();
+  s_sd_ok = false;
+  decide_led_status();
+}
+
+static void init_uart(void) {
+  // NOTE: Serial.begin() is done in setup(); keep this only for Serial1
+  Serial1.setRxBufferSize(UART_BUF_SIZE);
+  Serial1.begin(BB_UART_BAUD, SERIAL_8N1, BB_UART_RX_PIN, BB_UART_TX_PIN, false);
+  Serial1.setTimeout(50);
+}
+
+// ============================
+// === Logger task
+// ============================
+static void uart_logger_task(void *arg) {
+  DLOGI("Logger task started. Waiting for Serial Blackbox...");
+  uint8_t buf[READ_CHUNK];
+  s_last_rx_ms = millis();
+
+  // Start “waiting” (resolver will pick exact pattern)
+  s_logging_active = false;
+  s_ever_saw_header = false;
+  s_sd_low_space = space_low_now();
+  decide_led_status();
+
+  for (;;) {
+    int got = 0;
+
+    if (Serial1.available()) {
+      size_t n = min((int)sizeof(buf), (int)Serial1.available());
+      got = Serial1.read((uint8_t*)buf, n);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    uint32_t now_ms = millis();
+    s_uart_quiet_ms = now_ms - s_last_rx_ms;
+
+    if (got > 0) {
+      s_last_rx_ms = now_ms;
+      s_uart_quiet_ms = 0;
+
+      if (s_state == WAIT_HEADER) ring_put(&s_prebuf, buf, got);
+
+      // Detect "H " header lines
+      for (int i = 0; i < got; ++i) {
+        uint8_t b = buf[i];
+
+        if (s_at_line_start) s_linelen = 0;
+        if (s_linelen < BB_LINE_MAX - 1) {
+          s_line[s_linelen++] = (char)b;
+          s_line[s_linelen] = '\0';
+        }
+
+        if (b == '\n' || b == '\r') {
+          if (is_blackbox_header_line(s_line, s_linelen)) {
+            DLOGI("Header line detected: \"%.*s\"", (int)s_linelen, s_line);
+            s_ever_saw_header = true;
+            if (s_state == WAIT_HEADER) {
+              if (!open_new_file_and_dump_prebuf()) {
+                DLOGE("Failed to open file");
+              }
+            }
+            decide_led_status();
+          }
+          s_at_line_start = true;
+          s_linelen = 0;
+        } else {
+          s_at_line_start = false;
+        }
+      }
+
+      // Write raw stream to file if logging
+      if (s_state == LOGGING && s_logf) {
+        size_t w = s_logf.write(buf, got);
+        // Arduino File has getWriteError(); flush() has no return
+        if (w != (size_t)got || s_logf.getWriteError()) {
+          DLOGE("Write error");
+          s_sd_write_error = true;
+          decide_led_status();
+        } else {
+          s_since_flush += w;
+          if (s_since_flush >= FLUSH_BYTES) {
+            s_logf.flush();
+            s_since_flush = 0;
+          }
+        }
+      }
+    } else {
+      // timeout/no data: check idle close
+      if (s_state == LOGGING && (now_ms - s_last_rx_ms) >= IDLE_TIMEOUT_MS) {
+        DLOGI("Idle timeout reached");
+        indicate_file_closing_then_idle();
+        close_current_file();
+      }
+    }
+
+    // Periodic low-space check (cheap)
+    static uint32_t last_space_check_ms = 0;
+    if ((now_ms - last_space_check_ms) > 2000) { // every 2s
+      last_space_check_ms = now_ms;
+      bool low = space_low_now();
+      if (low != s_sd_low_space) {
+        s_sd_low_space = low;
+        decide_led_status();
+      }
+    }
+
+    // Update LED if quiet state changed meaningfully
+    static uint32_t prev_quiet_bucket = 0;
+    uint32_t bucket = (s_uart_quiet_ms > SERIAL_LOST_MS) ? 1 : 0;
+    if (bucket != prev_quiet_bucket) {
+      prev_quiet_bucket = bucket;
+      decide_led_status();
+    }
+  }
+}
+
+// ============================
+// === Arduino entry points
+// ============================
+void setup() {
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && (millis() - t0) < 3000) { delay(10); } // wait up to 3s for monitor
+
+  Serial.printf("\n--- Boot --- Reset reason: %s (%d)\n",
+                reset_reason_str(esp_reset_reason()), esp_reset_reason());
+  Serial.printf("Board: Lolin S2 Mini | BB UART RX=%d TX=%d | SD CS=%d SCK=%d MISO=%d MOSI=%d\n",
+                BB_UART_RX_PIN, BB_UART_TX_PIN, PIN_NUM_CS, PIN_NUM_SCLK, PIN_NUM_MISO, PIN_NUM_MOSI);
+
+  // LED: boot pattern
+  led_status_init();
+  led_set_status(LED_STAT_BOOTING);
+
+  // Serial1 + pins
+  Serial1.setRxBufferSize(UART_BUF_SIZE);
+  Serial1.begin(BB_UART_BAUD, SERIAL_8N1, BB_UART_RX_PIN, BB_UART_TX_PIN, false);
+  Serial1.setTimeout(50);
+
+  DLOGI("Starting Serial Blackbox logger (Arduino SD)");
+
+  // Mount SD (single retry already in your flow)
+  if (!init_sdspi()) {
+    DLOGE("SD mount failed; retrying in 3s");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    deinit_sdspi();
+    ESP.restart();
+
+  }
+
+  // Prepare next filename index by scanning (optional quick pass)
+  for (int i = 1; i <= MAX_FILE_INDEX; ++i) {
+    char p[24];
+    snprintf(p, sizeof(p), "/LOG%04d.BFL", i);
+    if (!path_exists(p)) { s_next_index = i; break; }
+  }
+
+  // From here, the UART task will drive status changes
+  xTaskCreatePinnedToCore(uart_logger_task, "uart_logger", 6144, NULL, 5, NULL, 0);
+
+  // After boot, let resolver pick the steady-state
+  vTaskDelay(pdMS_TO_TICKS(1500));
+  decide_led_status();
+}
+
+void loop() {
+  // Nothing here; the logger runs in its own task.
+  static uint32_t last_wait_msg = 0;
+  uint32_t now_ms = millis();
+
+  if (s_state == WAIT_HEADER && (now_ms - last_wait_msg) > 2000) {
+    last_wait_msg = now_ms;
+    DLOGI("Waiting… quiet=%ums (will show SERIAL_LOST after %ums)",
+          (unsigned)s_uart_quiet_ms, (unsigned)SERIAL_LOST_MS);
+  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
