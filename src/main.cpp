@@ -3,7 +3,7 @@
 #include <freertos/stream_buffer.h>
 #include <freertos/queue.h>
 #include <LittleFS.h>
-
+#include <Preferences.h>
 #include "web_server.h"
 #include "wifi_manager.h"
 #include "status_led.h"

@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 #include <WiFi.h>
+#include <Preferences.h>
 
 void WifiMgr::beginAP(const char* ssid, const char* pwd) {
   WiFi.mode(WIFI_AP);

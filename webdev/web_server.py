@@ -22,7 +22,6 @@ engine = Engine(
 TEMPLATE_VARS = dict(
     PLATFORM="ESP32-S2",   # whatever you want to preview as
     VERSION="dev (local)",
-    isTX=False,
     hasSubGHz=False,
     is8285=False,
 )
