@@ -1,0 +1,65 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include "WebContent.h"  // generated
+
+AsyncWebServer server(80);
+
+static void sendGz(AsyncWebServerRequest* req,
+                   const char* mime,
+                   const uint8_t* data,
+                   size_t len) {
+  auto* res = req->beginResponse_P(200, mime, data, len);
+  res->addHeader("Content-Encoding", "gzip");
+  res->addHeader("Cache-Control", "no-store");
+  req->send(res);
+}
+
+void setup() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("MinimalWebUI", "12345678");
+
+server.on("/", [](AsyncWebServerRequest* req){
+  sendGz(req, "text/html", (const uint8_t*)INDEX_HTML, sizeof(INDEX_HTML));
+});
+server.on("/elrs.css", [](AsyncWebServerRequest* req){
+  sendGz(req, "text/css", (const uint8_t*)ELRS_CSS, sizeof(ELRS_CSS));
+});
+server.on("/mui.js", [](AsyncWebServerRequest* req){
+  sendGz(req, "application/javascript", (const uint8_t*)MUI_JS, sizeof(MUI_JS));
+});
+server.on("/scan.js", [](AsyncWebServerRequest* req){
+  sendGz(req, "application/javascript", (const uint8_t*)SCAN_JS, sizeof(SCAN_JS));
+});
+// quiet the 500:
+server.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* req){
+  req->send(204);  // no content
+});
+
+
+  // Mock endpoints expected by the page
+  server.on("/target", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200, "application/json",
+      R"JSON({"target":"ESP32_S2_DEV","version":"dev (mock)","product_name":"Mock RX","lua_name":"Mock Device","reg_domain":"N/A","module-type":"RX","radio-type":"SX128X","has-sub-ghz":false})JSON");
+  });
+
+  server.on("/options.json", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200, "application/json",
+      R"JSON({"options":{"wifi-on-interval":"","home_wifi_ssid":"","home_wifi_password":"","flash-discriminator":12345678}})JSON");
+  });
+
+  server.on("/hardware.json", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200, "application/json",
+      R"JSON({"product_name":"Mock RX","device_name":"MockDevice","uid":[0,0,0,0,0,0,0,0]})JSON");
+  });
+
+  // No-op handlers to satisfy UI actions
+  server.on("/sethome", HTTP_POST, [](AsyncWebServerRequest* req){ req->send(200); });
+  server.on("/connect", HTTP_GET,   [](AsyncWebServerRequest* req){ req->send(200); });
+  server.on("/forget",  HTTP_GET,   [](AsyncWebServerRequest* req){ req->send(200); });
+  server.on("/update",  HTTP_POST,  [](AsyncWebServerRequest* req){ req->send(200); });
+
+  server.begin();
+}
+
+void loop() {}

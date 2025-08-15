@@ -1,0 +1,167 @@
+// ESP32-S2 SD card SPI3 debug test (Arduino)
+//
+// Uses SPI3 (general-purpose SPI) explicitly on ESP32-S2.
+// Verbose logs + multiple SPI speeds to diagnose mount issues.
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+
+// ====== PIN CHOICES (edit if needed) ======
+// Pick free GPIOs; avoid strapping pins (0/45/46) and USB (19/20).
+#define SD_CS    21   // Chip Select (safe general IO)
+#define SD_SCK   14   // SCK
+#define SD_MISO  12   // MISO
+#define SD_MOSI  13   // MOSI
+// ==========================================
+
+// Try these SPI clocks (slow -> fast)
+static const uint32_t kTryFreqs[] = { 1000000, 4000000, 10000000, 25000000 };
+
+// --- Use SPI3 on ESP32-S2 ---
+#if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32S2)
+  #include "driver/spi_common.h"   // for SPI3_HOST
+  SPIClass spi(SPI3_HOST);         // force GP-SPI3 on S2
+#else
+  // Fallback for non-S2 targets so this still compiles elsewhere
+  SPIClass spi(VSPI);
+#endif
+
+// ===== Helpers =====
+void listDir(fs::FS &fs, const char *dirname, uint8_t levels) {
+  File root = fs.open(dirname);
+  if (!root) { Serial.println("  [!] Failed to open directory"); return; }
+  if (!root.isDirectory()) { Serial.println("  [!] Not a directory"); return; }
+  File file = root.openNextFile();
+  while (file) {
+    if (file.isDirectory()) {
+      Serial.print("  DIR : "); Serial.println(file.name());
+      if (levels) listDir(fs, file.name(), levels - 1);
+    } else {
+      Serial.print("  FILE: "); Serial.print(file.name());
+      Serial.print("\tSIZE: "); Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+bool writeFile(fs::FS &fs, const char *path, const String &message) {
+  File f = fs.open(path, FILE_WRITE);
+  if (!f) { Serial.println("  [!] Failed to open file for writing"); return false; }
+  size_t n = f.print(message);
+  f.close();
+  Serial.printf("  Wrote %u bytes to %s\n", (unsigned)n, path);
+  return n == message.length();
+}
+
+bool readFile(fs::FS &fs, const char *path) {
+  File f = fs.open(path, FILE_READ);
+  if (!f) { Serial.println("  [!] Failed to open file for reading"); return false; }
+  Serial.printf("  Contents of %s:\n---8<---\n", path);
+  while (f.available()) Serial.write(f.read());
+  Serial.println("\n---8<---");
+  f.close();
+  return true;
+}
+
+void printCardInfo() {
+  uint8_t type = SD.cardType();
+  Serial.print("Card type: ");
+  if (type == CARD_NONE)       Serial.println("None");
+  else if (type == CARD_MMC)   Serial.println("MMC");
+  else if (type == CARD_SD)    Serial.println("SDSC");
+  else if (type == CARD_SDHC)  Serial.println("SDHC/SDXC");
+  else                         Serial.println("Unknown");
+
+  uint64_t sizeBytes = SD.cardSize();
+  if (sizeBytes > 0) {
+    double sizeMB = (double)sizeBytes / (1024.0 * 1024.0);
+    double sizeGB = sizeMB / 1024.0;
+    Serial.printf("Card size: %.0f MB (%.2f GB)\n", sizeMB, sizeGB);
+  }
+}
+
+void dumpPins() {
+  Serial.printf("Using SPI3 host with pins: SCK=%d  MISO=%d  MOSI=%d  CS=%d\n",
+                SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+}
+
+void preflightSPI() {
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);     // CS idle high
+  pinMode(SD_SCK, OUTPUT);  digitalWrite(SD_SCK, LOW);
+  pinMode(SD_MOSI, OUTPUT); digitalWrite(SD_MOSI, HIGH);
+  pinMode(SD_MISO, INPUT_PULLUP);
+
+  spi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  Serial.println("Preflight: sending 80 dummy clocks (CS high)...");
+  spi.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+  for (int i = 0; i < 10; ++i) spi.transfer(0xFF);
+  spi.endTransaction();
+
+  int misoIdle = digitalRead(SD_MISO);
+  Serial.printf("Preflight: MISO idle level = %s\n", misoIdle ? "HIGH" : "LOW");
+}
+
+bool tryMountAt(uint32_t hz) {
+  Serial.printf("Mounting SD (SPI3) at %u Hz...\n", (unsigned)hz);
+  bool ok = SD.begin(SD_CS, spi, hz);
+  if (!ok) { Serial.println("  -> mount FAIL"); return false; }
+  Serial.println("  -> mount OK");
+  return true;
+}
+
+bool mountWithRetries() {
+  for (uint32_t hz : kTryFreqs) {
+    if (tryMountAt(hz)) return true;
+    SD.end();
+    delay(50);
+  }
+  return false;
+}
+
+// ===== Arduino setup/loop =====
+void setup() {
+  Serial.begin(115200);
+  uint32_t start = millis();
+  while (!Serial && (millis() - start) < 4000) { delay(10); }
+
+  Serial.println();
+  Serial.println("=== ESP32-S2 SD over SPI3 (debug) ===");
+  Serial.printf("Chip: %s rev %d | SDK: %s\n",
+                ESP.getChipModel(), ESP.getChipRevision(), ESP.getSdkVersion());
+  dumpPins();
+  preflightSPI();
+
+  if (!mountWithRetries()) {
+    Serial.println();
+    Serial.println("[FATAL] SD mount failed on SPI3 at all tested speeds.");
+    Serial.println("Checks:");
+    Serial.println("  • 3.3 V only + common GND");
+    Serial.println("  • CS/SCK/MOSI/MISO match wiring; CS idles HIGH");
+    Serial.println("  • Avoid GPIO0/45/46 (strap; 46 input-only) and USB 19/20");
+    Serial.println("  • Try different GPIOs if your board routes some internally");
+    return;
+  }
+
+  printCardInfo();
+
+  Serial.println("\nRoot directory:");
+  listDir(SD, "/", 2);
+
+  Serial.println("\nWrite/read test:");
+  const char *testPath = "/test.txt";
+  String msg = String("Hello from ESP32-S2 (SPI3) @ ") + String(millis()) + " ms\n";
+  if (writeFile(SD, testPath, msg)) {
+    readFile(SD, testPath);
+  } else {
+    Serial.println("  Skipping read; write failed.");
+  }
+
+  Serial.println("\nDone.");
+}
+
+void loop() {
+  delay(1000);
+}

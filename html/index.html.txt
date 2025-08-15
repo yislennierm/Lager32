@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>My Minimal ELRS WebUI</title>
+<style>body{font-family:system-ui;margin:2rem} .card{padding:1rem;border:1px solid #ddd;border-radius:12px}</style>
+<h1>Receiver WebUI</h1>
+<div class="card">
+  <p>Hello from a tiny page built the ELRS way.</p>
+  <p>Build version: <span id="v">(loaded at /target)</span></p>
+</div>
+<script>
+  fetch('/target').then(r=>r.json()).then(j=>{
+    document.getElementById('v').textContent = j.version || '(unknown)';
+  }).catch(()=>{});
+</script>
