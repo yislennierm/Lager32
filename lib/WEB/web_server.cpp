@@ -16,8 +16,8 @@ static void sendGz(AsyncWebServerRequest* req, const char* mime,
   req->send(res);
 }
 
-void WebUi::begin(StreamBufferHandle_t buf, QueueHandle_t cmdQ) {
-  sBuf = buf; sCmdQ = cmdQ;
+void WebUi::begin(QueueHandle_t cmdQ, ILogSink* storage) {
+  sCmdQ = cmdQ;
 
   // Root HTML
   server.on("/", [](AsyncWebServerRequest* r){

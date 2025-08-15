@@ -952,8 +952,15 @@ function initBindingPhraseGen() {
 }
 
 function updateOptions(data) {
+  // --- storage radio group ---
+  if (data && typeof data['storage-type'] === 'string') {
+    const r = document.querySelector(`input[name="storage-type"][value="${data['storage-type']}"]`);
+    if (r) r.checked = true;
+  }
+
+  // existing code follows…
   for (const [key, value] of Object.entries(data || {})) {
-    if (key ==='wifi-on-interval' && value === -1) continue;
+    if (key === 'wifi-on-interval' && value === -1) continue;
     const el = _(key);
     if (el) {
       if (el.type === 'checkbox') el.checked = value;

@@ -1,9 +1,9 @@
 #pragma once
-#include <Arduino.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/stream_buffer.h>
 #include <freertos/queue.h>
+#include "storage.h"   // ILogSink
 
 namespace WebUi {
-  void begin(StreamBufferHandle_t buf, QueueHandle_t cmdQ);
+  // Web only needs the command queue and a storage sink to list/download files.
+  void begin(QueueHandle_t cmdQ, ILogSink* storage);
 }
