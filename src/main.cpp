@@ -60,6 +60,8 @@ void setup() {
   // Use our FlashLogSink (lib/STORAGE). Try normal mount first, then format if needed.
   static FlashLogSink flashSink;
   gStorage = &flashSink;
+  gStorage->begin(true);   // <-- pass bool to match ILogSink
+
 
   if (!gStorage->begin(false)) {
     Serial.println("[FS] Mount failed, trying to format...");

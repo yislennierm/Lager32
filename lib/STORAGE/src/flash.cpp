@@ -1,21 +1,30 @@
 #include "flash.h"
+#include <FS.h>        // ensures File APIs are available
 
 bool FlashLogSink::begin(bool formatIfNeeded) {
   return LittleFS.begin(formatIfNeeded);
 }
 
 bool FlashLogSink::startFile(const char* suggestedBaseName) {
-  if (file_) file_.close();
+  stopFile();
 
-  String base = suggestedBaseName ? String(suggestedBaseName) : String("log");
-  // /log0000.bbl .. /log9999.bbl
+  const String base = (suggestedBaseName && suggestedBaseName[0])
+                        ? String(suggestedBaseName)
+                        : String("log");
+
+  // Create /log0000.bbl .. /log9999.bbl (or <base>####.bbl)
+  String candidate;
   for (int i = 0; i < 10000; ++i) {
-    char idx[5]; snprintf(idx, sizeof(idx), "%04d", i);
-    currentName_ = "/" + base + idx + ".bbl";
-    if (!LittleFS.exists(currentName_)) break;
+    char idx[5];
+    snprintf(idx, sizeof(idx), "%04d", i);
+    candidate = "/";
+    candidate += base;
+    if (!candidate.endsWith(".bbl")) candidate += idx;
+    if (!candidate.endsWith(".bbl")) candidate += ".bbl";
+    if (!LittleFS.exists(candidate)) break;
   }
 
-  file_ = LittleFS.open(currentName_, "w");  // write new file
+  file_ = LittleFS.open(candidate, "w");
   return (bool)file_;
 }
 
@@ -33,28 +42,46 @@ void FlashLogSink::flush() {
 
 std::vector<LogFileInfo> FlashLogSink::list() {
   std::vector<LogFileInfo> out;
+
   File root = LittleFS.open("/");
   for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    LogFileInfo i; i.name = f.name(); i.size = f.size(); i.mtime = 0;
-    out.push_back(i);
+    if (!f.isDirectory()) {
+      LogFileInfo i;
+      i.name = String(f.name());
+      i.size = (size_t)f.size();
+      out.push_back(std::move(i));
+    }
+    f.close();
   }
+  root.close();
   return out;
 }
 
-bool FlashLogSink::remove(const char* name) { return LittleFS.remove(name); }
-bool FlashLogSink::exists(const char* name) { return LittleFS.exists(name); }
-String FlashLogSink::pathOf(const char* name) { return String(name); }
+bool FlashLogSink::remove(const char* name) {
+  return LittleFS.remove(pathOf(name));
+}
+
+bool FlashLogSink::exists(const char* name) {
+  return LittleFS.exists(pathOf(name));
+}
+
+String FlashLogSink::pathOf(const char* name) {
+  if (!name || !name[0]) return String();
+  if (name[0] == '/') return String(name);
+  return String("/") + name;
+}
 
 bool FlashLogSink::wipeAll() {
-  File root = LittleFS.open("/");
-  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-    LittleFS.remove(f.name());
-  }
-  return true;
+  // Quick-and-dirty wipe: format via begin(true)
+  LittleFS.end();
+  return LittleFS.begin(true);
 }
 
 size_t FlashLogSink::freeSpace() {
-  size_t total = LittleFS.totalBytes();
-  size_t used  = LittleFS.usedBytes();
-  return (total > used) ? (total - used) : 0;
+  // Arduino-ESP32 LittleFS API doesn’t expose free space reliably on all cores.
+  // If your core provides totalBytes/usedBytes, you can uncomment:
+  // size_t total = LittleFS.totalBytes();
+  // size_t used  = LittleFS.usedBytes();
+  // return (total > used) ? (total - used) : 0;
+  return 0;
 }

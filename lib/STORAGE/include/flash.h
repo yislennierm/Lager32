@@ -1,35 +1,24 @@
 #pragma once
 #include <Arduino.h>
-#include <vector>
+#include <LittleFS.h>
+#include "storage.h"
 
-struct LogFileInfo {
-  String name;
-  size_t size;
-  time_t mtime;
-};
-
-enum class LogCommand : uint8_t { Start, Stop, Mark };
-
-class ILogSink {
+// Concrete storage sink that writes to internal flash via LittleFS
+class FlashLogSink : public ILogSink {
 public:
-  virtual ~ILogSink() = default;
+  bool   begin(bool formatIfNeeded = false) override;
+  bool   startFile(const char* suggestedBaseName = nullptr) override;
+  void   stopFile() override;
+  size_t write(const uint8_t* data, size_t len) override;
+  void   flush() override;
 
-  // lifecycle
-  virtual bool begin(bool formatIfNeeded = false) = 0;
+  std::vector<LogFileInfo> list() override;
+  bool   remove(const char* name) override;
+  bool   exists(const char* name) override;
+  String pathOf(const char* name) override;
+  bool   wipeAll() override;
+  size_t freeSpace() override;
 
-  // file control
-  virtual bool startFile(const char* suggestedBaseName = nullptr) = 0;
-  virtual void stopFile() = 0;
-
-  // writes -------------- required by log_writer.cpp
-  virtual size_t write(const uint8_t* data, size_t len) = 0;
-  virtual void   flush() = 0;
-
-  // mgmt
-  virtual std::vector<LogFileInfo> list() = 0;
-  virtual bool    remove(const char* name) = 0;
-  virtual bool    exists(const char* name) = 0;
-  virtual String  pathOf(const char* name) = 0;
-  virtual bool    wipeAll() = 0;
-  virtual size_t  freeSpace() = 0;
+private:
+  File file_;
 };
