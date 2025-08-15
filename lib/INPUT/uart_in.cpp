@@ -5,7 +5,7 @@
 
 // ------- Compile-time debug knobs --------
 #ifndef UART_DEBUG
-#define UART_DEBUG 1          // 0 = silent, 1 = print stats
+#define UART_DEBUG 0          // 0 = silent, 1 = print stats
 #endif
 #ifndef UART_DEBUG_HEXDUMP
 #define UART_DEBUG_HEXDUMP 0  // 1 = print first bytes of each read as hex
@@ -20,7 +20,7 @@ static StreamBufferHandle_t sBuf = nullptr;
 static uart_port_t sPort = UART_NUM_1;
 
 static void hexdump(const uint8_t* p, size_t n, size_t max = 64) {
-#if UART_DEBUG && UART_DEBUG_HEXDUMP
+#if UART_DEBUG_HEXDUMP
   size_t m = n < max ? n : max;
   for (size_t i = 0; i < m; ++i) {
     if (i && (i % 16) == 0) Serial.println();

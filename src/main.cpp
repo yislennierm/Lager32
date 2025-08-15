@@ -9,6 +9,8 @@
 #include "uart_in.h"
 #include "sd_card.h"
 
+
+
 // Global IPC
 StreamBufferHandle_t gLogBuf;     // bytes from UART -> SD
 QueueHandle_t        gCmdQ;       // control commands (start/stop/mark)
@@ -31,7 +33,7 @@ void setup() {
   WebUi::begin(gLogBuf, gCmdQ);
 
   // UART in: set your pins/baud in UartIn.cpp
-  UartIn::begin(gLogBuf, UART_NUM_1, 250000);
+  UartIn::begin(gLogBuf, UART_NUM_1, 115200);
 
   // SD log: set your SD pins in SdLog.cpp
   SdLog::begin(gLogBuf, gCmdQ);
